@@ -1,14 +1,22 @@
 from maat import *
 import logging
 import time
+NUM_SOLUTIONS = 10
+
+def match_byte(probing_results, i):
+    ref = probing_results[0][i]
+    return all(map(lambda m: m[i] == ref, probing_results))
+
+
+def extract_predicate(results):
+    predicate = dict()
+    for i in range(len(results[0])):
+        if match_byte(results, i):
+            predicate[str(i)] = results[0][i]
+    return predicate
 
 class QueryRunner:
     def __init__(self, file, callsites_to_monitor, rec_addr=None, send_addr=None):
-        # still not sure about specs
-        m = MaatEngine(ARCH.X64, OS.LINUX)
-        args = [
-            m.vars.new_concolic_buffer("input", b'a'*INPUT_LEN, INPUT_LEN)
-        ]
         # Flag telling whether we should take a snapshot on the next symbolic branch
         snapshot_next = True
         ## Callback to be executed on every symbolic branch
@@ -21,10 +29,12 @@ class QueryRunner:
             snapshot_next = True
 
         ## Exploration hooks
-        m.hooks.add(EVENT.PATH, WHEN.BEFORE, name="path", callbacks=[path_cb])
 
         self.file = file
-        self.project = m.load(file, BIN.ELF64, args=args, libdirs=["."])
+        self.project = MaatEngine(ARCH.X64, OS.LINUX)
+        self.args = [self.project.vars.new_concolic_buffer("input", b'a'*INPUT_LEN, INPUT_LEN)]
+        self.project.load(file, BIN.ELF64, args=args, libdirs=["."])
+        self.project.hooks.add(EVENT.PATH, WHEN.BEFORE, name="path", callbacks=[path_cb])
         self.mode = None
         self.callsites_to_monitor = callsites_to_monitor
         self.rec_addr = rec_addr
@@ -45,14 +55,69 @@ class QueryRunner:
         logger.info('Performing membership, step by step')
         global snapshot_next
         global position = -1
-        answer = None
+        answer = False
+        deadend = False
+        skip_verification = False
         # We keep trying new paths as long as execution is stopped by reaching
-        # SUCCESS_ADDR or FAILURE_ADDR
+        # send/receive address
         t = time.process_time_ns()
-
-        while answer is not False and self.project.run() == STOP.HOOK:
+        while not deadend and self.project.run() == STOP.HOOK:
             position = position + 1
             if position == len(inputs):
+                # the word belongs to the language
+                ms_time = max(time.process_time_ns() - t, ms_time)
+                pt_time = time.process_time_ns()
+                total_prob_time = 0
+
+                # probing
+                logger.info('Membership is true - probing')
+                results = []
+                while self.project.run() == STOP.HOOK:
+                    if self.project.info.addr == self.send_addr:
+                        new_msg = self.project.cpu.rsi
+                        message_list = []
+                        for i in range(NUM_SOLUTIONS):
+                            message_list.append(new_msg)
+                            s = Solver()
+                            for c in self.project.path.constraints():
+                                s.add(c)
+                            new_msg_constraint = Constraint.__ne__(self.project.cpu.rsi, new_msg)
+                            s.add(new_msg_constraint)
+                            if not s.check():
+                                break
+                            else:
+                                self.project.vars.update_from(s.get_model())
+                                while self.project.run() == STOP.HOOK:
+                                    new_msg = self.project.cpu.rsi
+
+                        # Find predicate of all the msgs
+                        predicate = extract_predicate(message_list)
+                        # Create solver and add constraint to common msg
+                        s = Solver()
+                        for c in self.project.path.constraints():
+                            s.add(c)
+                        for byte_num in predicate:
+                            if predicate[byte_num] is not None:
+                                byte_constraint = Constraint.__ne__(self.project.cpu.rsi.as_int().to_bytes()[byte_num], predicate[byte_num])
+                                s.add(byte_constraint)
+
+                        results.extend(message_list)
+                        # Check if we can get another new msg
+                        if s.check():
+                            # If so continue
+                            self.project.vars.update_from(s.get_model())
+                        else:
+                            # Otherwise, break and finish
+                            break
+
+                    if self.project.info.addr == self.rec_addr:
+
+                        # Need to complete
+                total_prob_time = total_prob_time + (time.process_time_ns() - pt_time)
+                return results
+
+                position = position - 1
+                skip_verification = True
                 answer = True
                 break
             logger.info("Now at position %d" % position)
@@ -60,9 +125,9 @@ class QueryRunner:
             # we have to check if we sent/recieved the message we're
             # expecting accorrding to the input.
 
-            if m.info.addr == self.rec_addr or m.info.addr == self.send_addr:
-                msg = m.cpu.rsi.as_int()
-                length = m.cpu.edx.as_int()
+            if not skip_verification and (self.project.info.addr == self.rec_addr or self.project.info.addr == self.send_addr):
+                msg = self.project.cpu.rsi.as_int()
+                length = self.project.cpu.edx.as_int()
                 msg_bytes = msg.to_bytes(length, 'big')
                 expected_msg_predicate = inputs[position]
                 is_expected_msg = True
@@ -82,11 +147,11 @@ class QueryRunner:
                 logger.info("Retracing steps")
                 position = position - 1
                 if position == -1:
-                    answer = False
+                    deadend = True
                     break
                 # Restore latest snapshot. This brings us back to the last
                 # symbolic branch that was taken
-                m.restore_snapshot(remove=True)
+                self.project.restore_snapshot(remove=True)
                 # Use the solver to invert the branch condition, and find an
                 # input that takes the other path
                 s = Solver()
@@ -95,20 +160,20 @@ class QueryRunner:
                 # we compute will still reach the current branch.
                 # Since the snapshots are taken *before* branches are resolved,
                 # m.path.constraints() doesn't contain the current branch as a constraint.
-                for c in m.path.constraints():
+                for c in self.project.path.constraints():
                     s.add(c)
-                if m.info.branch.taken:
+                if self.project.info.branch.taken:
                     # If branch was previously taken, we negate the branch condition
                     # so that this time it is not taken
-                    s.add(m.info.branch.cond.invert())
+                    s.add(self.project.info.branch.cond.invert())
                 else:
                     # If the branch was not previously taken, we solve the branch condition
                     # so that this time it is taken
-                    s.add(m.info.branch.cond)
+                    s.add(self.project.info.branch.cond)
                 # If the solver found a model that inverts the current branch, apply this model
                 # to the current symbolic variables context and continue exploring the next path!
                 if s.check():
-                    m.vars.update_from(s.get_model())
+                    self.project.vars.update_from(s.get_model())
                     # When successfully inverting a branch, we set snapshot_next to False. We do
                     # this to avoid taking yet another snapshot of the current branch when
                     # resuming execution. We just inverted the branch, which means that one of
@@ -116,22 +181,13 @@ class QueryRunner:
                     # that the other will get explored now. So there is no need to take a
                     # snapshot to go back to that particular branch.
                     snapshot_next = False
+                    skip_verification = False
                     break
 
         ms_time = time.process_time_ns() - t
         if answer == False:
             logger.debug("the membership query resulted in False")
-            # the membership query resulted False
             return False, None, ms_time, None, None
-        # Probing phase
-        logger.info('Membership is true - probing')
-        t = time.process_time_ns()
-        new_messages = []
-        while self.project.run() == STOP.HOOK or self.project.run() == STOP.EXIT:
-            if m.info.addr == self.rec_addr or m.info.addr == self.send_addr:
-                msg = m.cpu.rsi
-                length = m.cpu.edx
-                new_messages.append(msg)
-            break
-        probe_time = time.process_time_ns() - t
-        return True, new_messages, ms_time, 0, probe_time
+        else:
+            logger.debug("the membership query resulted in True")
+            return True, results, ms_time, None, total_prob_time
