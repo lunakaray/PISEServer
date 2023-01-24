@@ -88,7 +88,7 @@ class QueryRunner:
                             else:
                                 self.project.vars.update_from(s.get_model())
                                 while self.project.run() == STOP.HOOK:
-                                    new_msg_value = self.project.mem.read(self.project.cpu.rsi, self.project.cpu.edx)
+                                    new_msg_value = self.project.mem.read(self.project.cpu.rsi, self.project.cpu.edx)                            
 
                         # Find predicate of all the msgs
                         predicate = extract_predicate(message_list)
@@ -111,11 +111,48 @@ class QueryRunner:
                             break
 
                     if self.project.info.addr == self.rec_addr:
+                        self.project.mem.make_concolic(self.project.cpu.rsi.as_int(), 1, self.project.cpu.edx).as_int(), "buf")
+                        while self.project.run() == STOP.HOOK:
+                            if self.project.info.addr == self.send_addr:
+                                #check
+                                new_msg_value = self.project.vars.get("buf")
+                                message_list = []
+                                for i in range(NUM_SOLUTIONS):
+                                    message_list.append(new_msg_value)
+                                    s = Solver()
+                                    for c in self.project.path.constraints():
+                                        s.add(c)
+                                    new_msg_constraint = Constraint.__ne__(self.project.vars.get("buf"), new_msg_value)
+                                    s.add(new_msg_constraint)
+                                    if not s.check():
+                                        break
+                                    else:
+                                        self.project.vars.update_from(s.get_model())
+                                        while self.project.run() == STOP.HOOK:
+                                            new_msg_value = self.project.vars.get("buf")
 
-                        # Need to complete
+
+                                # Find predicate of all the msgs
+                                predicate = extract_predicate(message_list)
+                                # Create solver and add constraint to common msg
+                                s = Solver()
+                                for c in self.project.path.constraints():
+                                    s.add(c)
+                                for byte_num in predicate:
+                                    if predicate[byte_num] is not None:
+                                        byte_constraint = Constraint.__ne__(self.project.vars.get("buf").to_bytes()[byte_num], predicate[byte_num])
+                                        s.add(byte_constraint)
+
+                                results.extend(message_list)
+                                # Check if we can get another new msg
+                                if s.check():
+                                    # If so continue
+                                    self.project.vars.update_from(s.get_model())
+                                else:
+                                    # Otherwise, break and finish
+                                    break
+
                 total_prob_time = total_prob_time + (time.process_time_ns() - pt_time)
-                return results
-
                 position = position - 1
                 skip_verification = True
                 answer = True
