@@ -74,21 +74,21 @@ class QueryRunner:
                 results = []
                 while self.project.run() == STOP.HOOK:
                     if self.project.info.addr == self.send_addr:
-                        new_msg = self.project.cpu.rsi
+                        new_msg_value = self.project.mem.read(self.project.cpu.rsi, self.project.cpu.edx)
                         message_list = []
                         for i in range(NUM_SOLUTIONS):
-                            message_list.append(new_msg)
+                            message_list.append(new_msg_value)
                             s = Solver()
                             for c in self.project.path.constraints():
                                 s.add(c)
-                            new_msg_constraint = Constraint.__ne__(self.project.cpu.rsi, new_msg)
+                            new_msg_constraint = Constraint.__ne__(self.project.mem.read(self.project.cpu.rsi, self.project.cpu.edx), new_msg_value)
                             s.add(new_msg_constraint)
                             if not s.check():
                                 break
                             else:
                                 self.project.vars.update_from(s.get_model())
                                 while self.project.run() == STOP.HOOK:
-                                    new_msg = self.project.cpu.rsi
+                                    new_msg_value = self.project.mem.read(self.project.cpu.rsi, self.project.cpu.edx)
 
                         # Find predicate of all the msgs
                         predicate = extract_predicate(message_list)
@@ -98,7 +98,7 @@ class QueryRunner:
                             s.add(c)
                         for byte_num in predicate:
                             if predicate[byte_num] is not None:
-                                byte_constraint = Constraint.__ne__(self.project.cpu.rsi.as_int().to_bytes()[byte_num], predicate[byte_num])
+                                byte_constraint = Constraint.__ne__(self.project.mem.read(self.project.cpu.rsi, self.project.cpu.edx).as_int().to_bytes()[byte_num], predicate[byte_num])
                                 s.add(byte_constraint)
 
                         results.extend(message_list)
@@ -126,8 +126,8 @@ class QueryRunner:
             # expecting accorrding to the input.
 
             if not skip_verification and (self.project.info.addr == self.rec_addr or self.project.info.addr == self.send_addr):
-                msg = self.project.cpu.rsi.as_int()
-                length = self.project.cpu.edx.as_int()
+                msg = self.project.mem.read(self.project.cpu.rsi, self.project.cpu.edx).as_int()
+                length = self.project.mem.read(self.project.cpu.edx, 8).as_int()
                 msg_bytes = msg.to_bytes(length, 'big')
                 expected_msg_predicate = inputs[position]
                 is_expected_msg = True
