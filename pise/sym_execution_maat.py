@@ -3,6 +3,8 @@ import logging
 import time
 NUM_SOLUTIONS = 10
 
+logger = logging.getLogger(__name__)
+
 def match_byte(probing_results, i):
     ref = probing_results[0][i]
     return all(map(lambda m: m[i] == ref, probing_results))
@@ -32,7 +34,7 @@ class QueryRunner:
 
         self.file = file
         self.project = MaatEngine(ARCH.X64, OS.LINUX)
-        self.args = [self.project.vars.new_concolic_buffer("input", b'a'*INPUT_LEN, INPUT_LEN)]
+        args = [self.project.vars.new_concolic_buffer("input", b'a'*100, 100)]
         self.project.load(file, BIN.ELF64, args=args, libdirs=["."])
         self.project.hooks.add(EVENT.PATH, WHEN.BEFORE, name="path", callbacks=[path_cb])
         self.mode = None
@@ -48,13 +50,14 @@ class QueryRunner:
             return
         logger.info('Setting hooks')
         for callsite in self.callsites_to_monitor:
-            callsite.set_hook(m)
+            callsite.set_hook(self.project)
         self.mode = 'membership'
 
-    def membership_step_by_step(inputs):
+    def membership_step_by_step(self, inputs):
         logger.info('Performing membership, step by step')
         global snapshot_next
-        global position = -1
+        global position
+        position = -1
         answer = False
         deadend = False
         skip_verification = False
@@ -88,7 +91,7 @@ class QueryRunner:
                             else:
                                 self.project.vars.update_from(s.get_model())
                                 while self.project.run() == STOP.HOOK:
-                                    new_msg_value = self.project.mem.read(self.project.cpu.rsi, self.project.cpu.edx)                            
+                                    new_msg_value = self.project.mem.read(self.project.cpu.rsi, self.project.cpu.edx)
 
                         # Find predicate of all the msgs
                         predicate = extract_predicate(message_list)
@@ -111,7 +114,7 @@ class QueryRunner:
                             break
 
                     if self.project.info.addr == self.rec_addr:
-                        self.project.mem.make_concolic(self.project.cpu.rsi.as_int(), 1, self.project.cpu.edx).as_int(), "buf")
+                        self.project.mem.make_concolic(self.project.cpu.rsi.as_int(), 1, self.project.cpu.edx.as_int(), "buf")
                         while self.project.run() == STOP.HOOK:
                             if self.project.info.addr == self.send_addr:
                                 #check
@@ -169,7 +172,7 @@ class QueryRunner:
                 expected_msg_predicate = inputs[position]
                 is_expected_msg = True
                 for i in enumerate(expected_msg_predicate):
-                    if expected_msg_predicate[i] is not None and expected_msg_predicate[i] != msg_bytes[i]
+                    if expected_msg_predicate[i] is not None and expected_msg_predicate[i] != msg_bytes[i]:
                         logger.info('The message we received/sent is not the one we are expecting')
                         logger.debug('The received/send message is %d and the one we are expecting (predicate) is %d' % (msg, expected_msg_predicate))
                         logger.debug('Different at the %d th byte,  expected %d != got %d' % (i, expected_msg_predicate[i], msg_bytes[i]))

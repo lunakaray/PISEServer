@@ -1,7 +1,5 @@
 import logging
-
 from maat import *
-# from typing import List
 from pise import sym_execution_maat, server
 
 
@@ -46,7 +44,7 @@ class ToyRecvHook:
 def main():
     logging.getLogger('pise').setLevel(logging.DEBUG)
     # logging.getLogger('angr').setLevel(logging.INFO)
-    query_runner = sym_execution_maat.QueryRunner('examples/toy_example/toy_example', [ToySendHook(0x61b), ToyRecvHook(0x627), 0x61b, 0x627])
+    query_runner = sym_execution_maat.QueryRunner('examples/toy_example/toy_example', callsites_to_monitor=[ToySendHook(0x61b), ToyRecvHook(0x627)], rec_addr=0x61b, send_addr=0x627)
     s = server.Server(query_runner=query_runner)
     s.listen()
 
