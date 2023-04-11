@@ -22,7 +22,7 @@ def extract_predicate(results):
 
 
 class QueryRunner:
-    def __init__(self, file, callsites_to_monitor, rec_addr=None, send_addr=None):
+    def __init__(self, file, callsites_to_monitor, rec_addr=None, send_addr=None, socket_address=None):
         # Flag telling whether we should take a snapshot on the next symbolic branch
         snapshot_next = True
 
@@ -35,18 +35,20 @@ class QueryRunner:
             # we want to take snapshots for the next ones
             snapshot_next = True
 
-        ## Exploration hooks
 
         self.file = file
         self.project = MaatEngine(ARCH.X64, OS.LINUX)
         args = [self.project.vars.new_concolic_buffer("input", b'a' * 100, 100)]
-        self.project.load(file, BIN.ELF64, args=args,
-                          libdirs=['/Users/lunakarayanni/Desktop/9th/project/PISE/PISEServer/pise/libs/libc.so.6', '/Users/lunakarayanni/Desktop/9th/project/PISE/PISEServer/pise/libs/ld-linux-x86-64.so.2'])
+        self.project.load(file, BIN.ELF64, args=args, base=0x04000000,
+                          libdirs=['/Users/lunakarayanni/Desktop/9th/project/PISE/PISEServer/pise/libs/libc.so.6',
+                                   '/Users/lunakarayanni/Desktop/9th/project/PISE/PISEServer/pise/libs/ld-linux-x86'
+                                   '-64.so.2'])
         self.project.hooks.add(EVENT.PATH, WHEN.BEFORE, name="path", callbacks=[path_cb])
         self.mode = None
         self.callsites_to_monitor = callsites_to_monitor
         self.rec_addr = rec_addr
         self.send_addr = send_addr
+        self.socket_addr = socket_address
         self.set_membership_hooks()
         # self.cache = SimulationCache()
         # self.probing_cache = ProbingCache()
@@ -66,11 +68,13 @@ class QueryRunner:
         position = -1
         answer = False
         deadend = False
-        skip_verification = False
+        ms_time = 0
         # We keep trying new paths as long as execution is stopped by reaching
         # send/receive address
         t = time.process_time_ns()
         while not deadend and self.project.run() == STOP.HOOK:
+            if self.project.info.addr == self.socket_addr:
+                continue
             position = position + 1
             if position == len(inputs):
                 # the word belongs to the language
@@ -82,6 +86,8 @@ class QueryRunner:
                 logger.info('Membership is true! - probing')
                 results = []
                 while self.project.run() == STOP.HOOK:
+                    if self.project.info.addr == self.socket_addr:
+                        continue
                     if self.project.info.addr == self.send_addr:
                         new_msg_value = self.project.mem.read(self.project.cpu.rsi, self.project.cpu.edx)
                         message_list = []
@@ -98,7 +104,9 @@ class QueryRunner:
                             else:
                                 self.project.vars.update_from(s.get_model())
                                 while self.project.run() == STOP.HOOK:
-                                    new_msg_value = self.project.mem.read(self.project.cpu.rsi, self.project.cpu.edx)
+                                    if self.project.info.addr != self.socket_addr:
+                                        new_msg_value = self.project.mem.read(self.project.cpu.rsi, self.project.cpu.edx)
+                                        break
 
                         # Find predicate of all the msgs
                         predicate = extract_predicate(message_list)
@@ -126,6 +134,8 @@ class QueryRunner:
                         self.project.mem.make_concolic(self.project.cpu.rsi.as_int(), 1, self.project.cpu.edx.as_int(),
                                                        "buf")
                         while self.project.run() == STOP.HOOK:
+                            if self.project.info.addr == self.socket_addr:
+                                continue
                             if self.project.info.addr == self.send_addr:
                                 # check
                                 new_msg_value = self.project.vars.get("buf")
@@ -137,12 +147,14 @@ class QueryRunner:
                                         s.add(c)
                                     new_msg_constraint = Constraint.__ne__(self.project.vars.get("buf"), new_msg_value)
                                     s.add(new_msg_constraint)
-                                    if not s.check():
+                                    if s.check():
                                         break
                                     else:
                                         self.project.vars.update_from(s.get_model())
                                         while self.project.run() == STOP.HOOK:
-                                            new_msg_value = self.project.vars.get("buf")
+                                            if self.project.info.addr != self.socket_addr:
+                                                new_msg_value = self.project.vars.get("buf")
+                                                break
 
                                 # Find predicate of all the msgs
                                 predicate = extract_predicate(message_list)
@@ -167,36 +179,46 @@ class QueryRunner:
 
                 total_prob_time = total_prob_time + (time.process_time_ns() - pt_time)
                 position = position - 1
-                skip_verification = True
                 answer = True
                 break
             logger.info("Now at position %d" % position)
             # If we found the path for a send/receive message,
-            # we have to check if we sent/recieved the message we're
-            # expecting accorrding to the input.
+            # we have to check if we sent/received the message we're
+            # expecting according to the input.
 
-            if not skip_verification and (
-                    self.project.info.addr == self.rec_addr or self.project.info.addr == self.send_addr):
-                msg = self.project.mem.read(self.project.cpu.rsi, self.project.cpu.edx).as_int()
-                length = self.project.mem.read(self.project.cpu.edx, 8).as_int()
-                msg_bytes = msg.to_bytes(length, 'big')
+            if self.project.info.addr == self.rec_addr or self.project.info.addr == self.send_addr:
                 expected_msg_predicate = inputs[position]
+                msg_bytes = bytearray(b'')
+                msg = 0
+                if self.project.info.addr == self.rec_addr:
+                    for i, pred in enumerate(expected_msg_predicate):
+                        if pred is not None:
+                            msg_bytes.append(pred)
+                        else:
+                            msg_bytes.append(1)
+                    msg_bytes = bytes(msg_bytes)
+                    msg = int.from_bytes(msg_bytes, 'big')
+                if self.project.info.addr == self.send_addr:
+                    msg = self.project.mem.read(self.project.cpu.rsi, self.project.cpu.edx).as_int()
+                    length = self.project.mem.read(self.project.cpu.edx, 8).as_int()
+                    msg_bytes = msg.to_bytes(length, 'big')
                 is_expected_msg = True
-                for i in enumerate(expected_msg_predicate):
-                    if expected_msg_predicate[i] is not None and expected_msg_predicate[i] != msg_bytes[i]:
+                for i, pred in enumerate(expected_msg_predicate):
+                    if pred is not None and pred != msg_bytes[i]:
                         logger.info('The message we received/sent is not the one we are expecting')
                         logger.debug(
                             'The received/send message is %d and the one we are expecting (predicate) is %d' % (
-                            msg, expected_msg_predicate))
-                        logger.debug('Different at the %d th byte,  expected %d != got %d' % (
-                        i, expected_msg_predicate[i], msg_bytes[i]))
+                                msg, expected_msg_predicate))
+                        logger.debug('Different at the %d th byte, expected %d != got %d' % (
+                            i, pred, msg_bytes[i]))
                         is_expected_msg = False
                         break
+
                 if is_expected_msg:
                     continue
 
             # Otherwise, restore previous snapshots until we find a branch condition
-            # that can successfuly be inverted to explore a new path
+            # that can successfully be inverted to explore a new path
             while True:
                 logger.info("Retracing steps")
                 position = position - 1
@@ -235,11 +257,10 @@ class QueryRunner:
                     # that the other will get explored now. So there is no need to take a
                     # snapshot to go back to that particular branch.
                     snapshot_next = False
-                    skip_verification = False
                     break
 
         ms_time = time.process_time_ns() - t
-        if answer == False:
+        if not answer:
             logger.debug("the membership query resulted in False")
             return False, None, ms_time, None, None
         else:
